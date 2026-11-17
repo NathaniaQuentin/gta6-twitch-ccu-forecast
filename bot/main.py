@@ -15,10 +15,15 @@ target's own log(hour-1 print), with the centre capped to the training range
 so the fit never extrapolates beyond the largest/smallest comparable.
 
 The median forecast is the fitted value at the target's log(v_1); the five
-quantiles are normal quantiles around it with a calibrated residual spread
-(residual sd x 0.55, floored at 0.2 log units). The 0.55 factor was chosen on
-the four practice cases: it keeps the 90% interval's empirical coverage at
-~0.90 while cutting the mean pinball loss well below the unscaled spread.
+quantiles are normal quantiles around it with a calibrated residual spread.
+The spread is the leave-one-out residual sd (see `loo_spread`): each training
+point is refit without itself, so the spread is an honest out-of-sample
+error estimate instead of the in-sample residual sd, which understates error
+because every point pulls its own fit toward itself. The LOO sd runs ~1.08x
+the in-sample sd, so its multiplier is 0.5 (0.5 x 1.08 ~= 0.54, matching the
+old 0.55 x in-sample sd); the result is floored at 0.2 log units. The 0.5
+factor was chosen on the four practice cases and checked against
+leave-one-out over the comparables (see NOTES.md).
 
 Training shapes are cleaned before fitting:
   - GTA VI's own pre-release category history (a comparable whose name
@@ -31,8 +36,8 @@ Training shapes are cleaned before fitting:
 
 Practice-case validation (answers reconstructed from SullyGnome's public
 hourly averages; hour-1 prints match the case files exactly):
-  mean pinball loss 0.142, versus 0.387 for the house persistence baseline.
-  p00 0.130, p01 0.145, p02 0.115, p03 0.178; 90% coverage 0.902.
+  mean pinball loss 0.141535, versus 0.387 for the house persistence baseline.
+  p00 0.128, p01 0.146, p02 0.115, p03 0.178; 90% coverage 0.902.
 
 How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in
 python:3.13-slim, standard library only: no network, no pip packages.
@@ -66,6 +71,10 @@ Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 BANDWIDTH = 1.5
 # Calibrated multiplier on the residual spread (see module docstring).
 SPREAD_MULT = 0.55
+# Multiplier on the leave-one-out residual spread. The LOO sd runs ~1.08x
+# the in-sample residual sd, so 0.5 x 1.08 ~= 0.54, matching SPREAD_MULT's
+# effective width while estimating the spread honestly per hour.
+LOO_SPREAD_MULT = 0.5
 # Floor / cap on the spread, in log units.
 SD_FLOOR = 0.2
 SD_CAP = 1.2
@@ -174,6 +183,34 @@ def wls_line(xs: list[float], ys: list[float], ws: list[float]):
     return b0, b1, math.sqrt(max(var, 0.0))
 
 
+def loo_spread(pts: list[tuple[float, float]], bw: float, lx_eff: float) -> float | None:
+    """Leave-one-out residual sd at one forecast hour.
+
+    Each training point is refit without itself, with the kernel centred on
+    that point itself (as if it were the target), and the squared residual is
+    weighted by the point's proximity to the actual target. In-sample
+    residuals understate the prediction error because every point pulls its
+    own fit toward itself; LOO residuals do not have that bias, so this is
+    the honest per-hour spread. Returns None if no refit succeeds.
+    """
+    num = 0.0
+    den = 0.0
+    for i, (xi, yi) in enumerate(pts):
+        xs_i = [x for j, (x, _) in enumerate(pts) if j != i]
+        ys_i = [y for j, (_, y) in enumerate(pts) if j != i]
+        ws_i = [math.exp(-0.5 * ((x - xi) / bw) ** 2) for x in xs_i]
+        fit_i = wls_line(xs_i, ys_i, ws_i)
+        if fit_i is None:
+            continue
+        b0_i, b1_i, _ = fit_i
+        w_tgt = math.exp(-0.5 * ((xi - lx_eff) / bw) ** 2)
+        num += w_tgt * (yi - (b0_i + b1_i * xi)) ** 2
+        den += w_tgt
+    if den <= 0:
+        return None
+    return math.sqrt(num / den)
+
+
 def hour_quantiles(shapes: list[dict], p1: float, h: int, zs: list[float]) -> list[float | int]:
     """The five quantiles for forecast hour h, given the training shapes."""
     lx = math.log(p1)
@@ -193,16 +230,19 @@ def hour_quantiles(shapes: list[dict], p1: float, h: int, zs: list[float]) -> li
         if fit is not None:
             b0, b1, sd = fit
             mu = b0 + b1 * lx_eff
+            sd_loo = loo_spread(pts, BANDWIDTH, lx_eff)
+            sd_use = sd_loo if sd_loo is not None else sd
+            mult_use = LOO_SPREAD_MULT if sd_loo is not None else SPREAD_MULT
+            s_eff = min(max(sd_use * mult_use, SD_FLOOR), SD_CAP)
         else:
             mu = sum(y for _, y in pts) / len(pts)
-            sd = 0.4
+            s_eff = min(max(0.4 * SPREAD_MULT, SD_FLOOR), SD_CAP)
     elif pts:
         ys = sorted(y for _, y in pts)
         mu = ys[len(ys) // 2]
-        sd = 0.4
+        s_eff = min(max(0.4 * SPREAD_MULT, SD_FLOOR), SD_CAP)
     else:
-        mu, sd = 0.0, 0.4
-    s_eff = min(max(sd * SPREAD_MULT, SD_FLOOR), SD_CAP)
+        mu, s_eff = 0.0, min(max(0.4 * SPREAD_MULT, SD_FLOOR), SD_CAP)
     qs: list[float | int] = []
     for z in zs:
         q = p1 * math.exp(mu + z * s_eff)
